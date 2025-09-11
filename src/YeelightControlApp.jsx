@@ -17,7 +17,7 @@ import { Power, RefreshCcw, Lightbulb, Settings2, Loader2 } from "lucide-react";
 
 // If your Express proxy serves API at http://pi:5005/api, set base to that.
 // You can also leave it as just "http://pi:5005" — the join() helper below will DTRT.
-const DEFAULT_BASE = "http://pi:5005/api";
+const DEFAULT_BASE = "http://192.168.0.7:5005/api";
 
 // --- fetch helpers ---------------------------------------------------------
 function join(base, path) {
