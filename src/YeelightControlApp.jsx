@@ -253,7 +253,6 @@ export default function YeelightControlApp() {
             <input
               value={baseUrl}
               onChange={(e) => setBaseUrl(e.target.value)}
-              placeholder="API base (e.g. http://pi:5005/api)"
               className="w-56 sm:w-72 rounded-xl bg-zinc-900 border border-zinc-700 px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-red-600"
             />
             <Button variant="ghost" onClick={reload}>
