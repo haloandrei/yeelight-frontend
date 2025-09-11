@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [react()],
   base: '/ui/',
   build: {
-    outDir: '/home/pi/yeelight-ui/ui',
+    outDir: '/home/haloandrei/yeelight-ui/ui',
     emptyOutDir: true
   }
 })
