@@ -19,6 +19,7 @@ import { Power, RefreshCcw, Lightbulb, Settings2, Loader2 } from "lucide-react";
 //   GET  /routines   -> { config, status }
 //   POST /routines   -> update routine config
 //   POST /routine/:name/start
+//   POST /routine/:name/stop
 
 // If your Express proxy serves API at http://pi:5005/api, set base to that.
 // You can also leave it as just "http://pi:5005" — the join() helper below will DTRT.
@@ -317,6 +318,7 @@ function useApi(baseUrl) {
     const qp = target ? `?target=${encodeURIComponent(target)}` : "";
     return jpost(baseUrl, `/routine/${encodeURIComponent(name)}/start${qp}`);
   };
+  const stopRoutine = (name) => jpost(baseUrl, `/routine/${encodeURIComponent(name)}/stop`);
 
   useEffect(() => {
     loadRoutines();
@@ -352,11 +354,12 @@ function useApi(baseUrl) {
     loadRoutines,
     saveRoutines,
     runRoutine,
+    stopRoutine,
   };
 }
 
 // --- Card ------------------------------------------------------------------
-function TargetCard({ title, target, onPower, onToggle, onBright, onCT, onRGB, currentOn, currentState, quickRoutines, onRunRoutine, routinesStatus }) {
+function TargetCard({ title, target, onPower, onToggle, onBright, onCT, onRGB, currentOn, currentState, quickRoutines, onRunRoutine, routinesStatus, anyRoutineRunning }) {
   const [level, setLevel] = useState(50);
   const [ct, setCt] = useState(4000);
   const [rgb, setRgb] = useState([255, 120, 30]);
@@ -403,7 +406,7 @@ function TargetCard({ title, target, onPower, onToggle, onBright, onCT, onRGB, c
                 key={routine.name}
                 variant="solid"
                 className="px-2 py-1 text-xs"
-                disabled={busy || running}
+                disabled={busy || running || anyRoutineRunning}
                 onClick={() => exec(() => onRunRoutine(routine.name, target))}
               >
                 {running ? `${routine.label}…` : routine.label}
@@ -432,7 +435,7 @@ function TargetCard({ title, target, onPower, onToggle, onBright, onCT, onRGB, c
   );
 }
 
-function RoutineCard({ name, label, config, targets, onChange, onRun, running, lastRun }) {
+function RoutineCard({ name, label, config, targets, onChange, onRun, onStop, running, lastRun, anyRunning }) {
   const update = (field, value) => {
     onChange(name, { ...config, [field]: value });
   };
@@ -524,8 +527,11 @@ function RoutineCard({ name, label, config, targets, onChange, onRun, running, l
         </div>
 
         <div className="flex items-center gap-2">
-          <Button variant="solid" onClick={() => onRun(name)} disabled={running}>
+          <Button variant="solid" onClick={() => onRun(name)} disabled={running || anyRunning}>
             Run {label}
+          </Button>
+          <Button variant="ghost" onClick={() => onStop?.(name)} disabled={!running}>
+            Stop
           </Button>
         </div>
       </div>
@@ -557,6 +563,7 @@ export default function YeelightControlApp() {
     loadRoutines,
     saveRoutines,
     runRoutine,
+    stopRoutine,
   } = useApi(baseUrl);
 
   const bulbNames = useMemo(() => Object.keys(bulbs).sort(), [bulbs]);
@@ -567,6 +574,11 @@ export default function YeelightControlApp() {
     bulbNames.forEach((name) => opts.push({ value: name, label: `Bulb: ${name}`, key: `bulb:${name}` }));
     return opts;
   }, [groupNames, bulbNames]);
+
+  const anyRoutineRunning = useMemo(
+    () => Object.values(routinesStatus?.running || {}).some(Boolean),
+    [routinesStatus]
+  );
 
   const quickRoutineButtons = useMemo(() => ([
     { name: "boost", label: "Boost" },
@@ -703,6 +715,7 @@ export default function YeelightControlApp() {
                   quickRoutines={quickRoutineButtons}
                   onRunRoutine={runRoutine}
                   routinesStatus={routinesStatus?.running}
+                  anyRoutineRunning={anyRoutineRunning}
                   onPower={api.power}
                   onToggle={api.toggle}
                   onBright={api.bright}
@@ -750,8 +763,10 @@ export default function YeelightControlApp() {
               targets={presenceOptions}
               onChange={updateRoutine}
               onRun={runRoutine}
+              onStop={stopRoutine}
               running={!!routinesStatus?.running?.sleep}
               lastRun={routinesStatus?.last_run?.sleep}
+              anyRunning={anyRoutineRunning && !routinesStatus?.running?.sleep}
             />
             <RoutineCard
               name="wake"
@@ -760,8 +775,10 @@ export default function YeelightControlApp() {
               targets={presenceOptions}
               onChange={updateRoutine}
               onRun={runRoutine}
+              onStop={stopRoutine}
               running={!!routinesStatus?.running?.wake}
               lastRun={routinesStatus?.last_run?.wake}
+              anyRunning={anyRoutineRunning && !routinesStatus?.running?.wake}
             />
             <RoutineCard
               name="boost"
@@ -770,8 +787,10 @@ export default function YeelightControlApp() {
               targets={presenceOptions}
               onChange={updateRoutine}
               onRun={runRoutine}
+              onStop={stopRoutine}
               running={!!routinesStatus?.running?.boost}
               lastRun={routinesStatus?.last_run?.boost}
+              anyRunning={anyRoutineRunning && !routinesStatus?.running?.boost}
             />
           </div>
           <div className="mt-3 flex items-center gap-2">
