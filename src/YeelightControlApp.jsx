@@ -126,6 +126,8 @@ function useYeelight() {
   const [bulbs, setBulbs] = useState({});
   const [groups, setGroups] = useState({});
   const [states, setStates] = useState({});
+  const [presence, setPresence] = useState({ config: {}, status: {} });
+  const [routines, setRoutines] = useState({ config: {}, status: {} });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [lastSyncAt, setLastSyncAt] = useState(0);
@@ -160,27 +162,36 @@ function useYeelight() {
     }
   }, [fetchStateSnapshot]);
 
+  const loadAutomation = useCallback(async () => {
+    const [nextPresence, nextRoutines] = await Promise.all([
+      request("/presence"),
+      request("/routines"),
+    ]);
+    setPresence(nextPresence || { config: {}, status: {} });
+    setRoutines(nextRoutines || { config: {}, status: {} });
+  }, []);
+
   const refreshAll = useCallback(async () => {
     setError("");
     setLoading(true);
     try {
-      await Promise.all([loadTopology(), loadState()]);
+      await Promise.all([loadTopology(), loadState(), loadAutomation()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, [loadState, loadTopology]);
+  }, [loadAutomation, loadState, loadTopology]);
 
   useEffect(() => {
     refreshAll().catch(() => undefined);
     const topologyTimer = setInterval(() => {
-      loadTopology().catch(() => undefined);
+      Promise.all([loadTopology(), loadAutomation()]).catch(() => undefined);
     }, 30000);
     return () => {
       clearInterval(topologyTimer);
     };
-  }, [loadState, loadTopology, refreshAll]);
+  }, [loadAutomation, loadState, loadTopology, refreshAll]);
 
   useEffect(() => {
     const onVisible = () => {
@@ -341,13 +352,64 @@ function useYeelight() {
         ),
       );
     },
+    setPresenceConfig: async (patch) => {
+      await withPending("presence", async () => {
+        const current = presence?.config || {};
+        await safeAction(
+          () => request(
+            "/presence",
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ ...current, ...patch }),
+            },
+            12000,
+          ),
+        );
+        await loadAutomation();
+      });
+    },
+    updateRoutine: async (name, patch) => {
+      if (!name) return;
+      await withPending(`routine:${name}:save`, async () => {
+        const current = routines?.config?.[name] || {};
+        await safeAction(
+          () => request(
+            "/routines",
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ [name]: { ...current, ...patch } }),
+            },
+            12000,
+          ),
+        );
+        await loadAutomation();
+      });
+    },
+    startRoutine: async (name) => {
+      if (!name) return;
+      await withPending(`routine:${name}:run`, async () => {
+        await safeAction(() => request(`/routine/${encodeURIComponent(name)}/start`, { method: "POST" }, 12000));
+        await Promise.all([loadAutomation(), loadState()]);
+      });
+    },
+    stopRoutine: async (name) => {
+      if (!name) return;
+      await withPending(`routine:${name}:run`, async () => {
+        await safeAction(() => request(`/routine/${encodeURIComponent(name)}/stop`, { method: "POST" }, 12000));
+        await Promise.all([loadAutomation(), loadState()]);
+      });
+    },
     isPending: (target) => Boolean(pendingTargets[target]),
-  }), [patchTargets, refreshAll, safeAction, withPending, pendingTargets, fetchStateSnapshot, resolveTargets]);
+  }), [patchTargets, refreshAll, safeAction, withPending, pendingTargets, fetchStateSnapshot, resolveTargets, presence, routines, loadAutomation, loadState]);
 
   return {
     bulbs,
     groups,
     states,
+    presence,
+    routines,
     loading,
     error,
     lastSyncAt,
@@ -562,13 +624,294 @@ function ControlCard({ title, target, state, actions, members }) {
   );
 }
 
+function formatUnixSeconds(ts) {
+  if (!ts) return "never";
+  return new Date(ts * 1000).toLocaleTimeString();
+}
+
+function AutomationPanel({ bulbs, groups, presence, routines, actions }) {
+  const presenceConfig = presence?.config || {};
+  const presenceStatus = presence?.status || {};
+  const routineConfig = routines?.config || {};
+  const routineStatus = routines?.status || {};
+
+  const targetOptions = useMemo(() => {
+    const all = ["all", ...Object.keys(groups || {}), ...Object.keys(bulbs || {})];
+    return Array.from(new Set(all));
+  }, [groups, bulbs]);
+
+  const routineOptions = useMemo(() => {
+    const names = Object.keys(routineConfig || {});
+    if (!names.includes("boost")) names.push("boost");
+    return names;
+  }, [routineConfig]);
+
+  const [presenceDraft, setPresenceDraft] = useState({
+    enabled: false,
+    device_name: "",
+    device_mac: "",
+    device_iface: "",
+    start_time: "19:00",
+    end_time: "06:00",
+    target: "all",
+    routine: "boost",
+    poll_interval_sec: 30,
+    cooldown_sec: 0,
+  });
+
+  const [routineDraft, setRoutineDraft] = useState({
+    wake: {},
+    sleep: {},
+  });
+
+  useEffect(() => {
+    setPresenceDraft((prev) => ({ ...prev, ...presenceConfig }));
+  }, [presenceConfig]);
+
+  useEffect(() => {
+    setRoutineDraft({
+      wake: { ...(routineConfig.wake || {}) },
+      sleep: { ...(routineConfig.sleep || {}) },
+    });
+  }, [routineConfig]);
+
+  const updateRoutineField = (name, key, value) => {
+    setRoutineDraft((prev) => ({
+      ...prev,
+      [name]: {
+        ...(prev[name] || {}),
+        [key]: value,
+      },
+    }));
+  };
+
+  return (
+    <section className="mb-6">
+      <div className="mb-2 flex items-center justify-between">
+        <h2 className="text-base font-semibold">Automation</h2>
+        <span className="text-xs text-zinc-400">Wake/Sleep + Wi-Fi presence</span>
+      </div>
+
+      <div className="grid gap-3 lg:grid-cols-3">
+        <article className="rounded-2xl border border-zinc-700 bg-zinc-900/70 p-3 sm:p-4 lg:col-span-1">
+          <div className="mb-3 flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-white">Presence Trigger</h3>
+            <span className={`rounded-full border px-2 py-1 text-xs ${presenceStatus.present ? "border-emerald-500/50 text-emerald-300" : "border-zinc-700 text-zinc-400"}`}>
+              {presenceStatus.present ? "present" : "away"}
+            </span>
+          </div>
+
+          <div className="space-y-2">
+            <label className="flex items-center gap-2 text-xs text-zinc-200">
+              <input
+                type="checkbox"
+                checked={Boolean(presenceDraft.enabled)}
+                onChange={(event) => setPresenceDraft((prev) => ({ ...prev, enabled: event.target.checked }))}
+                className="accent-red-500"
+              />
+              Enabled
+            </label>
+
+            <input
+              value={presenceDraft.device_name || ""}
+              onChange={(event) => setPresenceDraft((prev) => ({ ...prev, device_name: event.target.value }))}
+              placeholder="device hostname (phone/laptop)"
+              className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100"
+            />
+            <input
+              value={presenceDraft.device_mac || ""}
+              onChange={(event) => setPresenceDraft((prev) => ({ ...prev, device_mac: event.target.value }))}
+              placeholder="device mac (optional)"
+              className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100"
+            />
+            <input
+              value={presenceDraft.device_iface || ""}
+              onChange={(event) => setPresenceDraft((prev) => ({ ...prev, device_iface: event.target.value }))}
+              placeholder="interface (optional, ex: wlan0)"
+              className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100"
+            />
+
+            <div className="grid grid-cols-2 gap-2">
+              <input
+                type="time"
+                value={presenceDraft.start_time || "19:00"}
+                onChange={(event) => setPresenceDraft((prev) => ({ ...prev, start_time: event.target.value }))}
+                className="rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100"
+              />
+              <input
+                type="time"
+                value={presenceDraft.end_time || "06:00"}
+                onChange={(event) => setPresenceDraft((prev) => ({ ...prev, end_time: event.target.value }))}
+                className="rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100"
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <select
+                value={presenceDraft.target || "all"}
+                onChange={(event) => setPresenceDraft((prev) => ({ ...prev, target: event.target.value }))}
+                className="rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100"
+              >
+                {targetOptions.map((option) => <option key={option} value={option}>{option}</option>)}
+              </select>
+              <select
+                value={presenceDraft.routine || "boost"}
+                onChange={(event) => setPresenceDraft((prev) => ({ ...prev, routine: event.target.value }))}
+                className="rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100"
+              >
+                {routineOptions.map((option) => <option key={option} value={option}>{option}</option>)}
+              </select>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <input
+                type="number"
+                min={5}
+                value={presenceDraft.poll_interval_sec ?? 30}
+                onChange={(event) => setPresenceDraft((prev) => ({ ...prev, poll_interval_sec: Number(event.target.value) || 30 }))}
+                className="rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100"
+              />
+              <input
+                type="number"
+                min={0}
+                value={presenceDraft.cooldown_sec ?? 0}
+                onChange={(event) => setPresenceDraft((prev) => ({ ...prev, cooldown_sec: Number(event.target.value) || 0 }))}
+                className="rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100"
+              />
+            </div>
+
+            <button
+              type="button"
+              onClick={() => actions.setPresenceConfig(presenceDraft)}
+              disabled={actions.isPending("presence")}
+              className="w-full rounded-lg border border-zinc-600 bg-zinc-800 px-3 py-2 text-xs font-semibold text-white hover:bg-zinc-700 disabled:opacity-50"
+            >
+              {actions.isPending("presence") ? "Saving..." : "Save Presence"}
+            </button>
+
+            <p className="text-[11px] text-zinc-400">
+              Last seen {formatUnixSeconds(presenceStatus.last_seen)} • Last trigger {formatUnixSeconds(presenceStatus.last_trigger)}
+            </p>
+          </div>
+        </article>
+
+        <div className="grid gap-3 lg:col-span-2 sm:grid-cols-2">
+          {["wake", "sleep"].map((name) => {
+            const cfg = routineDraft[name] || {};
+            const running = Boolean(routineStatus?.running?.[name]);
+            const runPending = actions.isPending(`routine:${name}:run`);
+            const savePending = actions.isPending(`routine:${name}:save`);
+            return (
+              <article key={name} className="rounded-2xl border border-zinc-700 bg-zinc-900/70 p-3 sm:p-4">
+                <div className="mb-3 flex items-center justify-between">
+                  <h3 className="text-sm font-semibold capitalize text-white">{name}</h3>
+                  <span className={`rounded-full border px-2 py-1 text-xs ${running ? "border-emerald-500/50 text-emerald-300" : "border-zinc-700 text-zinc-400"}`}>
+                    {running ? "running" : "stopped"}
+                  </span>
+                </div>
+
+                <div className="space-y-2">
+                  <select
+                    value={cfg.target || "all"}
+                    onChange={(event) => updateRoutineField(name, "target", event.target.value)}
+                    className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100"
+                  >
+                    {targetOptions.map((option) => <option key={option} value={option}>{option}</option>)}
+                  </select>
+
+                  <div className="grid grid-cols-3 gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      value={cfg.duration_min ?? 30}
+                      onChange={(event) => updateRoutineField(name, "duration_min", Number(event.target.value) || 1)}
+                      className="rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100"
+                      title="Minutes"
+                    />
+                    <input
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={cfg.start_bright ?? 10}
+                      onChange={(event) => updateRoutineField(name, "start_bright", clamp(Number(event.target.value) || 1, 1, 100))}
+                      className="rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100"
+                      title="Start brightness"
+                    />
+                    <input
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={cfg.end_bright ?? 100}
+                      onChange={(event) => updateRoutineField(name, "end_bright", clamp(Number(event.target.value) || 1, 1, 100))}
+                      className="rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100"
+                      title="End brightness"
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <input
+                      type="number"
+                      min={1700}
+                      max={6500}
+                      value={cfg.start_ct ?? 2200}
+                      onChange={(event) => updateRoutineField(name, "start_ct", clamp(Number(event.target.value) || 1700, 1700, 6500))}
+                      className="rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100"
+                      title="Start CT"
+                    />
+                    <input
+                      type="number"
+                      min={1700}
+                      max={6500}
+                      value={cfg.end_ct ?? 5000}
+                      onChange={(event) => updateRoutineField(name, "end_ct", clamp(Number(event.target.value) || 1700, 1700, 6500))}
+                      className="rounded-lg border border-zinc-700 bg-zinc-950 px-2 py-1.5 text-xs text-zinc-100"
+                      title="End CT"
+                    />
+                  </div>
+                </div>
+
+                <div className="mt-3 flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => actions.startRoutine(name)}
+                    disabled={runPending}
+                    className="flex-1 rounded-lg border border-emerald-600/50 bg-emerald-700/40 px-2 py-1.5 text-xs font-semibold text-emerald-100 hover:bg-emerald-600/50 disabled:opacity-50"
+                  >
+                    {runPending ? "Working..." : "Start"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => actions.stopRoutine(name)}
+                    disabled={runPending}
+                    className="flex-1 rounded-lg border border-zinc-600 bg-zinc-800 px-2 py-1.5 text-xs font-semibold text-zinc-100 hover:bg-zinc-700 disabled:opacity-50"
+                  >
+                    Stop
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => actions.updateRoutine(name, cfg)}
+                    disabled={savePending}
+                    className="flex-1 rounded-lg border border-zinc-600 bg-zinc-800 px-2 py-1.5 text-xs font-semibold text-zinc-100 hover:bg-zinc-700 disabled:opacity-50"
+                  >
+                    {savePending ? "Saving..." : "Save"}
+                  </button>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function formatSync(ts) {
   if (!ts) return "waiting";
   return new Date(ts).toLocaleTimeString();
 }
 
 export default function YeelightControlApp() {
-  const { bulbs, groups, states, loading, error, lastSyncAt, liveMode, actions } = useYeelight();
+  const { bulbs, groups, states, presence, routines, loading, error, lastSyncAt, liveMode, actions } = useYeelight();
 
   const bulbNames = useMemo(() => Object.keys(bulbs).sort(), [bulbs]);
   const groupEntries = useMemo(() => Object.entries(groups), [groups]);
@@ -619,6 +962,14 @@ export default function YeelightControlApp() {
             {error}
           </div>
         ) : null}
+
+        <AutomationPanel
+          bulbs={bulbs}
+          groups={groups}
+          presence={presence}
+          routines={routines}
+          actions={actions}
+        />
 
         <section className="mb-6">
           <div className="mb-2 flex items-center justify-between">
