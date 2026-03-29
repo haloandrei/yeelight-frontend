@@ -133,6 +133,14 @@ function useYeelight() {
   const [pendingTargets, setPendingTargets] = useState({});
   const stateInFlightRef = useRef(false);
 
+  const fetchStateSnapshot = useCallback(async () => {
+    const nextState = await request("/state");
+    const normalized = nextState || {};
+    setStates(normalized);
+    setLastSyncAt(Date.now());
+    return normalized;
+  }, []);
+
   const loadTopology = useCallback(async () => {
     const [nextBulbs, nextGroups] = await Promise.all([
       request("/bulbs"),
@@ -146,13 +154,11 @@ function useYeelight() {
     if (stateInFlightRef.current) return;
     stateInFlightRef.current = true;
     try {
-      const nextState = await request("/state");
-      setStates(nextState || {});
-      setLastSyncAt(Date.now());
+      await fetchStateSnapshot();
     } finally {
       stateInFlightRef.current = false;
     }
-  }, []);
+  }, [fetchStateSnapshot]);
 
   const refreshAll = useCallback(async () => {
     setError("");
@@ -282,8 +288,23 @@ function useYeelight() {
     power: async (target, on) => {
       patchTargets(target, { power: on ? "on" : "off" });
       await withPending(target, async () => {
-        const res = await safeAction(() => request(`/power/${encodeURIComponent(target)}/${on ? "on" : "off"}?burst=2&retries=2`, { method: "POST" }, 12000));
+        const retries = on ? 2 : 4;
+        const res = await safeAction(() => request(`/power/${encodeURIComponent(target)}/${on ? "on" : "off"}?burst=2&retries=${retries}`, { method: "POST" }, 12000));
         if (res?.ok === false && res?.failed) {
+          if (!on) {
+            try {
+              await new Promise((resolve) => setTimeout(resolve, 180));
+              const freshState = await fetchStateSnapshot();
+              const names = resolveTargets(target);
+              const allOff = names.length > 0 && names.every((name) => freshState?.[name]?.power === "off");
+              if (allOff) {
+                setError("");
+                return;
+              }
+            } catch {
+              // keep partial failure message when state check fails
+            }
+          }
           setError(`Power ${on ? "on" : "off"} partial failure: ${res.failed} bulb(s) unreachable after retries.`);
         }
       });
@@ -321,7 +342,7 @@ function useYeelight() {
       );
     },
     isPending: (target) => Boolean(pendingTargets[target]),
-  }), [patchTargets, refreshAll, safeAction, withPending, pendingTargets]);
+  }), [patchTargets, refreshAll, safeAction, withPending, pendingTargets, fetchStateSnapshot, resolveTargets]);
 
   return {
     bulbs,
