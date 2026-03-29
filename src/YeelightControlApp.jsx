@@ -125,6 +125,7 @@ async function request(path, options = {}, timeoutMs = 9000, dedupeKey = "") {
 function useYeelight() {
   const [bulbs, setBulbs] = useState({});
   const [groups, setGroups] = useState({});
+  const [music, setMusic] = useState({});
   const [states, setStates] = useState({});
   const [presence, setPresence] = useState({ config: {}, status: {} });
   const [routines, setRoutines] = useState({ config: {}, status: {} });
@@ -134,22 +135,36 @@ function useYeelight() {
   const [liveMode, setLiveMode] = useState("poll");
   const [pendingTargets, setPendingTargets] = useState({});
   const stateInFlightRef = useRef(false);
+  const lockedBulbsRef = useRef({});
 
-  const fetchStateSnapshot = useCallback(async () => {
-    const nextState = await request("/state");
-    const normalized = nextState || {};
-    setStates(normalized);
-    setLastSyncAt(Date.now());
+  const applyRemoteStates = useCallback((incoming, stamp = Date.now()) => {
+    const normalized = incoming && typeof incoming === "object" ? incoming : {};
+    setStates((prev) => {
+      const next = { ...prev };
+      for (const [name, remote] of Object.entries(normalized)) {
+        if ((lockedBulbsRef.current[name] || 0) > 0) continue;
+        next[name] = remote;
+      }
+      return next;
+    });
+    setLastSyncAt(stamp);
     return normalized;
   }, []);
 
+  const fetchStateSnapshot = useCallback(async () => {
+    const nextState = await request("/state");
+    return applyRemoteStates(nextState, Date.now());
+  }, [applyRemoteStates]);
+
   const loadTopology = useCallback(async () => {
-    const [nextBulbs, nextGroups] = await Promise.all([
+    const [nextBulbs, nextGroups, nextMusic] = await Promise.all([
       request("/bulbs"),
       request("/groups"),
+      request("/music"),
     ]);
     setBulbs(nextBulbs || {});
     setGroups(nextGroups || {});
+    setMusic(nextMusic?.enabled || {});
   }, []);
 
   const loadState = useCallback(async () => {
@@ -211,8 +226,7 @@ function useYeelight() {
       try {
         const payload = JSON.parse(event.data || "{}");
         if (payload?.states && typeof payload.states === "object") {
-          setStates(payload.states);
-          setLastSyncAt(payload.at || Date.now());
+          applyRemoteStates(payload.states, payload.at || Date.now());
           setLiveMode("stream");
         }
       } catch {
@@ -235,7 +249,7 @@ function useYeelight() {
     return () => {
       es.close();
     };
-  }, []);
+  }, [applyRemoteStates]);
 
   const resolveTargets = useCallback((target) => {
     if (target === "all") return Object.keys(bulbs);
@@ -253,6 +267,30 @@ function useYeelight() {
       return next;
     });
   }, [resolveTargets]);
+
+  const lockBulbNames = useCallback((names, delta) => {
+    if (!Array.isArray(names) || names.length === 0) return;
+    const next = { ...lockedBulbsRef.current };
+    names.forEach((name) => {
+      const count = (next[name] || 0) + delta;
+      if (count <= 0) {
+        delete next[name];
+      } else {
+        next[name] = count;
+      }
+    });
+    lockedBulbsRef.current = next;
+  }, []);
+
+  const withTargetLock = useCallback(async (target, run) => {
+    const names = resolveTargets(target);
+    lockBulbNames(names, 1);
+    try {
+      return await run();
+    } finally {
+      lockBulbNames(names, -1);
+    }
+  }, [lockBulbNames, resolveTargets]);
 
   const setPending = useCallback((target, delta) => {
     setPendingTargets((prev) => {
@@ -300,7 +338,10 @@ function useYeelight() {
       patchTargets(target, { power: on ? "on" : "off" });
       await withPending(target, async () => {
         const retries = on ? 2 : 4;
-        const res = await safeAction(() => request(`/power/${encodeURIComponent(target)}/${on ? "on" : "off"}?burst=2&retries=${retries}`, { method: "POST" }, 12000));
+        const res = await withTargetLock(
+          target,
+          () => safeAction(() => request(`/power/${encodeURIComponent(target)}/${on ? "on" : "off"}?burst=2&retries=${retries}`, { method: "POST" }, 12000)),
+        );
         if (res?.ok === false && res?.failed) {
           if (!on) {
             try {
@@ -322,7 +363,7 @@ function useYeelight() {
     },
     toggle: async (target) => {
       await withPending(target, async () => {
-        const res = await safeAction(() => request(`/toggle/${encodeURIComponent(target)}`, { method: "POST" }, 12000));
+        const res = await withTargetLock(target, () => safeAction(() => request(`/toggle/${encodeURIComponent(target)}`, { method: "POST" }, 12000)));
         if (res?.ok === false && res?.failed) {
           setError(`Toggle partial failure: ${res.failed} bulb(s) unreachable after retries.`);
         }
@@ -331,24 +372,30 @@ function useYeelight() {
     bright: async (target, level) => {
       const nextLevel = clamp(Math.round(level), 1, 100);
       patchTargets(target, { bright: nextLevel, power: "on" });
-      await safeAction(
-        () => request(
-          `/bright/${encodeURIComponent(target)}?level=${nextLevel}`,
-          { method: "POST" },
-          12000,
-          `bright:${target}`,
+      await withTargetLock(
+        target,
+        () => safeAction(
+          () => request(
+            `/bright/${encodeURIComponent(target)}?level=${nextLevel}`,
+            { method: "POST" },
+            12000,
+            `bright:${target}`,
+          ),
         ),
       );
     },
     rgb: async (target, rgb) => {
       const [r, g, b] = rgb.map((v) => clamp(Math.round(v), 0, 255));
       patchTargets(target, { rgb: [r, g, b], color_mode: 1, power: "on" });
-      await safeAction(
-        () => request(
-          `/rgb/${encodeURIComponent(target)}?r=${r}&g=${g}&b=${b}`,
-          { method: "POST" },
-          12000,
-          `rgb:${target}`,
+      await withTargetLock(
+        target,
+        () => safeAction(
+          () => request(
+            `/rgb/${encodeURIComponent(target)}?r=${r}&g=${g}&b=${b}`,
+            { method: "POST" },
+            12000,
+            `rgb:${target}`,
+          ),
         ),
       );
     },
@@ -401,12 +448,25 @@ function useYeelight() {
         await Promise.all([loadAutomation(), loadState()]);
       });
     },
+    setMusicMode: async (target, enabled) => {
+      if (!target) return;
+      await withPending(`music:${target}`, async () => {
+        const state = enabled ? "on" : "off";
+        const result = await safeAction(() => request(`/music/${encodeURIComponent(target)}/${state}`, { method: "POST" }, 12000));
+        if (result?.enabled && typeof result.enabled === "object") {
+          setMusic(result.enabled);
+        } else {
+          await loadTopology();
+        }
+      });
+    },
     isPending: (target) => Boolean(pendingTargets[target]),
-  }), [patchTargets, refreshAll, safeAction, withPending, pendingTargets, fetchStateSnapshot, resolveTargets, presence, routines, loadAutomation, loadState]);
+  }), [patchTargets, refreshAll, safeAction, withPending, pendingTargets, fetchStateSnapshot, resolveTargets, presence, routines, loadAutomation, loadState, withTargetLock, loadTopology]);
 
   return {
     bulbs,
     groups,
+    music,
     states,
     presence,
     routines,
@@ -507,7 +567,7 @@ function HsvColorPicker({ rgb, onChange, disabled = false }) {
   );
 }
 
-function ControlCard({ title, target, state, actions, members }) {
+function ControlCard({ title, target, state, actions, members, music }) {
   const [brightness, setBrightness] = useState(50);
   const [rgb, setRgb] = useState([255, 110, 30]);
 
@@ -528,10 +588,16 @@ function ControlCard({ title, target, state, actions, members }) {
     actions.rgb(target, nextRgb);
   }, 120);
   const pending = actions.isPending(target);
+  const musicPending = actions.isPending(`music:${target}`);
 
   const onState = state?.power || "mixed";
   const stateColor = onState === "on" ? "text-emerald-300" : onState === "off" ? "text-zinc-400" : "text-amber-300";
   const stateText = onState === "on" ? "ON" : onState === "off" ? "OFF" : "MIXED";
+  const memberMusic = Array.isArray(members) ? members.map((name) => music?.[name]).filter((v) => typeof v === "boolean") : [];
+  const musicAllOn = memberMusic.length > 0 && memberMusic.every(Boolean);
+  const musicAllOff = memberMusic.length > 0 && memberMusic.every((v) => !v);
+  const musicStateText = musicAllOn ? "ON" : musicAllOff ? "OFF" : "MIXED";
+  const nextMusicEnabled = !musicAllOn;
 
   return (
     <article className="rounded-2xl border border-zinc-700 bg-zinc-900/70 p-2.5 sm:p-4">
@@ -620,6 +686,20 @@ function ControlCard({ title, target, state, actions, members }) {
           }
         }}
       />
+
+      {Array.isArray(members) ? (
+        <div className="mt-3 flex items-center justify-between rounded-lg border border-zinc-700 bg-zinc-950/70 px-2 py-2">
+          <span className="text-xs text-zinc-300">Music mode: <span className="font-semibold">{musicStateText}</span></span>
+          <button
+            type="button"
+            disabled={pending || musicPending}
+            onClick={() => actions.setMusicMode(target, nextMusicEnabled)}
+            className="rounded-md border border-zinc-600 bg-zinc-800 px-2 py-1 text-xs font-semibold text-white hover:bg-zinc-700 disabled:opacity-50"
+          >
+            {musicPending ? "Switching..." : nextMusicEnabled ? "Enable" : "Disable"}
+          </button>
+        </div>
+      ) : null}
     </article>
   );
 }
@@ -911,7 +991,7 @@ function formatSync(ts) {
 }
 
 export default function YeelightControlApp() {
-  const { bulbs, groups, states, presence, routines, loading, error, lastSyncAt, liveMode, actions } = useYeelight();
+  const { bulbs, groups, music, states, presence, routines, loading, error, lastSyncAt, liveMode, actions } = useYeelight();
 
   const bulbNames = useMemo(() => Object.keys(bulbs).sort(), [bulbs]);
   const groupEntries = useMemo(() => Object.entries(groups), [groups]);
@@ -963,14 +1043,6 @@ export default function YeelightControlApp() {
           </div>
         ) : null}
 
-        <AutomationPanel
-          bulbs={bulbs}
-          groups={groups}
-          presence={presence}
-          routines={routines}
-          actions={actions}
-        />
-
         <section className="mb-6">
           <div className="mb-2 flex items-center justify-between">
             <h2 className="text-base font-semibold">Groups</h2>
@@ -997,6 +1069,7 @@ export default function YeelightControlApp() {
                   title={groupName}
                   target={groupName}
                   members={members}
+                  music={music}
                   state={aggregate}
                   actions={actions}
                 />
@@ -1004,6 +1077,14 @@ export default function YeelightControlApp() {
             })}
           </div>
         </section>
+
+        <AutomationPanel
+          bulbs={bulbs}
+          groups={groups}
+          presence={presence}
+          routines={routines}
+          actions={actions}
+        />
 
         <section>
           <div className="mb-2 flex items-center justify-between">
@@ -1013,13 +1094,14 @@ export default function YeelightControlApp() {
 
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {bulbNames.map((name) => (
-              <ControlCard
-                key={name}
-                title={name}
-                target={name}
-                state={states[name] || {}}
-                actions={actions}
-              />
+                <ControlCard
+                  key={name}
+                  title={name}
+                  target={name}
+                  state={states[name] || {}}
+                  music={music}
+                  actions={actions}
+                />
             ))}
           </div>
         </section>
