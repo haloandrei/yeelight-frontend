@@ -338,9 +338,10 @@ function useYeelight() {
       patchTargets(target, { power: on ? "on" : "off" });
       await withPending(target, async () => {
         const retries = on ? 2 : 4;
+        const burst = on ? 2 : 1;
         const res = await withTargetLock(
           target,
-          () => safeAction(() => request(`/power/${encodeURIComponent(target)}/${on ? "on" : "off"}?burst=2&retries=${retries}`, { method: "POST" }, 12000)),
+          () => safeAction(() => request(`/power/${encodeURIComponent(target)}/${on ? "on" : "off"}?burst=${burst}&retries=${retries}`, { method: "POST" }, 12000)),
         );
         if (res?.ok === false && res?.failed) {
           if (!on) {
