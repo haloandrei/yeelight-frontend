@@ -1066,7 +1066,7 @@ export default function YeelightControlApp() {
               className="inline-flex w-[10.5rem] items-center justify-center gap-2 rounded-xl border border-red-500/40 bg-red-600/90 px-3 py-2 text-sm font-semibold text-white hover:bg-red-500 disabled:opacity-80 sm:w-[12rem]"
             >
               {allPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Power className="h-4 w-4" />}
-              <span>{allPending ? "Switching..." : "Shut Down All"}</span>
+              <span>{allPending ? "Switching..." : "Shut Down"}</span>
             </button>
           </div>
         </div>
