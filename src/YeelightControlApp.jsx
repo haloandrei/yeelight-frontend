@@ -62,36 +62,6 @@ const hsvToRgb = ({ h, s, v }) => {
   ];
 };
 
-function useThrottledAction(action, intervalMs = 120) {
-  const lastRunRef = useRef(0);
-  const timeoutRef = useRef(null);
-  const queuedArgsRef = useRef(null);
-
-  useEffect(() => () => clearTimeout(timeoutRef.current), []);
-
-  return useCallback((...args) => {
-    const now = Date.now();
-    const elapsed = now - lastRunRef.current;
-    queuedArgsRef.current = args;
-
-    const run = () => {
-      lastRunRef.current = Date.now();
-      const queued = queuedArgsRef.current;
-      queuedArgsRef.current = null;
-      action(...queued);
-    };
-
-    if (elapsed >= intervalMs) {
-      clearTimeout(timeoutRef.current);
-      run();
-      return;
-    }
-
-    clearTimeout(timeoutRef.current);
-    timeoutRef.current = setTimeout(run, intervalMs - elapsed);
-  }, [action, intervalMs]);
-}
-
 async function request(path, options = {}, timeoutMs = 9000, dedupeKey = "") {
   if (dedupeKey) {
     const previous = REQUEST_DEDUP.get(dedupeKey);
@@ -151,8 +121,8 @@ function useYeelight() {
     return normalized;
   }, []);
 
-  const fetchStateSnapshot = useCallback(async () => {
-    const nextState = await request("/state");
+  const fetchStateSnapshot = useCallback(async (fresh = false) => {
+    const nextState = await request(fresh ? "/state?fresh=1" : "/state");
     return applyRemoteStates(nextState, Date.now());
   }, [applyRemoteStates]);
 
@@ -167,11 +137,11 @@ function useYeelight() {
     setMusic(nextMusic?.enabled || {});
   }, []);
 
-  const loadState = useCallback(async () => {
+  const loadState = useCallback(async (fresh = false) => {
     if (stateInFlightRef.current) return;
     stateInFlightRef.current = true;
     try {
-      await fetchStateSnapshot();
+      await fetchStateSnapshot(fresh);
     } finally {
       stateInFlightRef.current = false;
     }
@@ -314,7 +284,7 @@ function useYeelight() {
     }
   }, [setPending]);
 
-  const safeAction = useCallback(async (run, fallbackRefresh = true) => {
+  const safeAction = useCallback(async (run, fallbackRefresh = true, fallbackFresh = false) => {
     setError("");
     try {
       const result = await run();
@@ -326,28 +296,49 @@ function useYeelight() {
       }
       setError(err instanceof Error ? err.message : String(err));
       if (fallbackRefresh) {
-        loadState().catch(() => undefined);
+        loadState(fallbackFresh).catch(() => undefined);
       }
       return null;
     }
   }, [loadState]);
+
+  const saveRoutineConfig = useCallback(async (name, patch) => {
+    if (!name) return null;
+    const current = routines?.config?.[name] || {};
+    const res = await safeAction(
+      () => request(
+        "/routines",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ [name]: { ...current, ...(patch || {}) } }),
+        },
+        12000,
+      ),
+      false,
+    );
+    if (res?.config) {
+      setRoutines((prev) => ({ ...(prev || {}), config: res.config, status: prev?.status || {} }));
+    }
+    return res;
+  }, [routines, safeAction]);
 
   const actions = useMemo(() => ({
     refresh: refreshAll,
     power: async (target, on) => {
       patchTargets(target, { power: on ? "on" : "off" });
       await withPending(target, async () => {
-        const retries = on ? 2 : 4;
-        const burst = on ? 2 : 1;
+        const retries = on ? 1 : 2;
+        const burst = 1;
         const res = await withTargetLock(
           target,
-          () => safeAction(() => request(`/power/${encodeURIComponent(target)}/${on ? "on" : "off"}?burst=${burst}&retries=${retries}`, { method: "POST" }, 12000)),
+          () => safeAction(() => request(`/power/${encodeURIComponent(target)}/${on ? "on" : "off"}?burst=${burst}&retries=${retries}`, { method: "POST" }, 12000), true, !on),
         );
         if (res?.ok === false && res?.failed) {
           if (!on) {
             try {
               await new Promise((resolve) => setTimeout(resolve, 180));
-              const freshState = await fetchStateSnapshot();
+              const freshState = await fetchStateSnapshot(true);
               const names = resolveTargets(target);
               const allOff = names.length > 0 && names.every((name) => freshState?.[name]?.power === "off");
               if (allOff) {
@@ -364,7 +355,7 @@ function useYeelight() {
     },
     toggle: async (target) => {
       await withPending(target, async () => {
-        const res = await withTargetLock(target, () => safeAction(() => request(`/toggle/${encodeURIComponent(target)}`, { method: "POST" }, 12000)));
+        const res = await withTargetLock(target, () => safeAction(() => request(`/toggle/${encodeURIComponent(target)}`, { method: "POST" }, 12000), true, true));
         if (res?.ok === false && res?.failed) {
           setError(`Toggle partial failure: ${res.failed} bulb(s) unreachable after retries.`);
         }
@@ -420,33 +411,26 @@ function useYeelight() {
     updateRoutine: async (name, patch) => {
       if (!name) return;
       await withPending(`routine:${name}:save`, async () => {
-        const current = routines?.config?.[name] || {};
-        await safeAction(
-          () => request(
-            "/routines",
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ [name]: { ...current, ...patch } }),
-            },
-            12000,
-          ),
-        );
+        await saveRoutineConfig(name, patch);
         await loadAutomation();
       });
     },
-    startRoutine: async (name) => {
+    startRoutine: async (name, patch) => {
       if (!name) return;
       await withPending(`routine:${name}:run`, async () => {
+        if (patch && typeof patch === "object") {
+          const saved = await saveRoutineConfig(name, patch);
+          if (!saved?.ok) return;
+        }
         await safeAction(() => request(`/routine/${encodeURIComponent(name)}/start`, { method: "POST" }, 12000));
-        await Promise.all([loadAutomation(), loadState()]);
+        await Promise.all([loadAutomation(), loadState(true)]);
       });
     },
     stopRoutine: async (name) => {
       if (!name) return;
       await withPending(`routine:${name}:run`, async () => {
         await safeAction(() => request(`/routine/${encodeURIComponent(name)}/stop`, { method: "POST" }, 12000));
-        await Promise.all([loadAutomation(), loadState()]);
+        await Promise.all([loadAutomation(), loadState(true)]);
       });
     },
     setMusicMode: async (target, enabled) => {
@@ -462,7 +446,7 @@ function useYeelight() {
       });
     },
     isPending: (target) => Boolean(pendingTargets[target]),
-  }), [patchTargets, refreshAll, safeAction, withPending, pendingTargets, fetchStateSnapshot, resolveTargets, presence, routines, loadAutomation, loadState, withTargetLock, loadTopology]);
+  }), [patchTargets, refreshAll, safeAction, withPending, pendingTargets, fetchStateSnapshot, resolveTargets, presence, loadAutomation, loadState, withTargetLock, loadTopology, saveRoutineConfig]);
 
   return {
     bulbs,
@@ -495,18 +479,41 @@ function groupAggregate(memberNames, states) {
   };
 }
 
-function HsvColorPicker({ rgb, onChange, disabled = false }) {
+function HsvColorPicker({ rgb, onPreview, onCommit, disabled = false }) {
   const [hsv, setHsv] = useState(() => rgbToHsv(rgb));
   const planeRef = useRef(null);
   const draggingRef = useRef(false);
+  const hsvRef = useRef(rgbToHsv(rgb));
+  const latestRgbRef = useRef(rgb);
+  const lastCommittedRef = useRef(Array.isArray(rgb) ? rgb.join(",") : "");
+  const internalPreviewRef = useRef(false);
 
   useEffect(() => {
-    setHsv(rgbToHsv(rgb));
+    const nextHsv = rgbToHsv(rgb);
+    hsvRef.current = nextHsv;
+    latestRgbRef.current = rgb;
+    if (!internalPreviewRef.current) {
+      lastCommittedRef.current = Array.isArray(rgb) ? rgb.join(",") : "";
+    }
+    internalPreviewRef.current = false;
+    setHsv(nextHsv);
   }, [rgb]);
 
-  const emit = (next) => {
+  const preview = (next) => {
+    const nextRgb = hsvToRgb(next);
+    latestRgbRef.current = nextRgb;
+    hsvRef.current = next;
     setHsv(next);
-    onChange(hsvToRgb(next));
+    internalPreviewRef.current = true;
+    onPreview?.(nextRgb);
+  };
+
+  const commit = () => {
+    const nextRgb = latestRgbRef.current;
+    const key = Array.isArray(nextRgb) ? nextRgb.join(",") : "";
+    if (!key || key === lastCommittedRef.current) return;
+    lastCommittedRef.current = key;
+    onCommit?.(nextRgb);
   };
 
   const updateFromPointer = (event) => {
@@ -514,7 +521,7 @@ function HsvColorPicker({ rgb, onChange, disabled = false }) {
     const rect = planeRef.current.getBoundingClientRect();
     const sat = clamp(((event.clientX - rect.left) / rect.width) * 100, 0, 100);
     const val = clamp((1 - (event.clientY - rect.top) / rect.height) * 100, 0, 100);
-    emit({ ...hsv, s: sat, v: val });
+    preview({ ...hsvRef.current, s: sat, v: val });
   };
 
   return (
@@ -540,7 +547,18 @@ function HsvColorPicker({ rgb, onChange, disabled = false }) {
         }}
         onPointerUp={(event) => {
           draggingRef.current = false;
-          event.currentTarget.releasePointerCapture(event.pointerId);
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          }
+          commit();
+        }}
+        onPointerCancel={() => {
+          draggingRef.current = false;
+          commit();
+        }}
+        onLostPointerCapture={() => {
+          draggingRef.current = false;
+          commit();
         }}
       >
         <div
@@ -557,7 +575,11 @@ function HsvColorPicker({ rgb, onChange, disabled = false }) {
         min={0}
         max={360}
         value={Math.round(hsv.h)}
-        onChange={(event) => emit({ ...hsv, h: Number(event.target.value) })}
+        onChange={(event) => preview({ ...hsvRef.current, h: Number(event.target.value) })}
+        onPointerUp={commit}
+        onTouchEnd={commit}
+        onKeyUp={commit}
+        onBlur={commit}
         disabled={disabled}
         className="w-full accent-red-500"
         style={{
@@ -571,25 +593,41 @@ function HsvColorPicker({ rgb, onChange, disabled = false }) {
 function ControlCard({ title, target, state, actions, members, music }) {
   const [brightness, setBrightness] = useState(50);
   const [rgb, setRgb] = useState([255, 110, 30]);
+  const committedBrightnessRef = useRef(50);
+  const committedRgbRef = useRef("255,110,30");
 
   useEffect(() => {
     if (typeof state?.bright === "number") {
-      setBrightness(clamp(state.bright, 1, 100));
+      const next = clamp(state.bright, 1, 100);
+      committedBrightnessRef.current = next;
+      setBrightness(next);
     }
     if (Array.isArray(state?.rgb) && state.rgb.length === 3) {
-      setRgb(state.rgb.map((v) => clamp(Number(v) || 0, 0, 255)));
+      const nextRgb = state.rgb.map((v) => clamp(Number(v) || 0, 0, 255));
+      committedRgbRef.current = nextRgb.join(",");
+      setRgb(nextRgb);
     }
   }, [state]);
 
-  const throttledBrightness = useThrottledAction((value) => {
-    actions.bright(target, value);
-  }, 90);
-
-  const throttledColor = useThrottledAction((nextRgb) => {
-    actions.rgb(target, nextRgb);
-  }, 120);
   const pending = actions.isPending(target);
   const musicPending = actions.isPending(`music:${target}`);
+
+  const commitBrightness = (value = brightness) => {
+    if (pending) return;
+    const next = clamp(Math.round(value), 1, 100);
+    if (next === committedBrightnessRef.current) return;
+    committedBrightnessRef.current = next;
+    actions.bright(target, next);
+  };
+
+  const commitRgb = (nextRgb) => {
+    if (pending || !Array.isArray(nextRgb)) return;
+    const normalized = nextRgb.map((v) => clamp(Math.round(v), 0, 255));
+    const key = normalized.join(",");
+    if (key === committedRgbRef.current) return;
+    committedRgbRef.current = key;
+    actions.rgb(target, normalized);
+  };
 
   const onState = state?.power || "mixed";
   const stateColor = onState === "on" ? "text-emerald-300" : onState === "off" ? "text-zinc-400" : "text-amber-300";
@@ -663,10 +701,11 @@ function ControlCard({ title, target, state, actions, members, music }) {
           onChange={(event) => {
             const next = Number(event.target.value);
             setBrightness(next);
-            if (!pending) {
-              throttledBrightness(next);
-            }
           }}
+          onPointerUp={(event) => commitBrightness(Number(event.currentTarget.value))}
+          onTouchEnd={(event) => commitBrightness(Number(event.currentTarget.value))}
+          onKeyUp={(event) => commitBrightness(Number(event.currentTarget.value))}
+          onBlur={(event) => commitBrightness(Number(event.currentTarget.value))}
           className="w-full accent-red-500"
         />
       </div>
@@ -680,12 +719,8 @@ function ControlCard({ title, target, state, actions, members, music }) {
       <HsvColorPicker
         rgb={rgb}
         disabled={pending}
-        onChange={(nextRgb) => {
-          setRgb(nextRgb);
-          if (!pending) {
-            throttledColor(nextRgb);
-          }
-        }}
+        onPreview={setRgb}
+        onCommit={commitRgb}
       />
 
       {Array.isArray(members) ? (
@@ -711,9 +746,9 @@ function formatUnixSeconds(ts) {
 }
 
 function AutomationPanel({ bulbs, groups, presence, routines, actions }) {
-  const presenceConfig = presence?.config || {};
+  const presenceConfig = useMemo(() => presence?.config || {}, [presence?.config]);
   const presenceStatus = presence?.status || {};
-  const routineConfig = routines?.config || {};
+  const routineConfig = useMemo(() => routines?.config || {}, [routines?.config]);
   const routineStatus = routines?.status || {};
 
   const targetOptions = useMemo(() => {
@@ -954,11 +989,11 @@ function AutomationPanel({ bulbs, groups, presence, routines, actions }) {
                 <div className="mt-3 flex gap-2">
                   <button
                     type="button"
-                    onClick={() => actions.startRoutine(name)}
+                    onClick={() => actions.startRoutine(name, cfg)}
                     disabled={runPending}
                     className="flex-1 rounded-lg border border-emerald-600/50 bg-emerald-700/40 px-2 py-1.5 text-xs font-semibold text-emerald-100 hover:bg-emerald-600/50 disabled:opacity-50"
                   >
-                    {runPending ? "Working..." : "Start"}
+                    {runPending ? "Working..." : "Save + Start"}
                   </button>
                   <button
                     type="button"
@@ -1028,10 +1063,10 @@ export default function YeelightControlApp() {
               type="button"
               onClick={() => actions.power("all", false)}
               disabled={allPending}
-              className="inline-flex items-center gap-2 rounded-xl border border-red-500/40 bg-red-600/90 px-3 py-2 text-sm font-semibold text-white hover:bg-red-500"
+              className="inline-flex w-[10.5rem] items-center justify-center gap-2 rounded-xl border border-red-500/40 bg-red-600/90 px-3 py-2 text-sm font-semibold text-white hover:bg-red-500 disabled:opacity-80 sm:w-[12rem]"
             >
               {allPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Power className="h-4 w-4" />}
-              {allPending ? "Switching..." : "Shut Down All Bulbs"}
+              <span>{allPending ? "Switching..." : "Shut Down All"}</span>
             </button>
           </div>
         </div>
