@@ -6,6 +6,12 @@ const REQUEST_DEDUP = new Map();
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
+const LIGHT_PRESETS = [
+  { key: "white-max", label: "White 100", ct: 6500, bright: 100, className: "border-sky-300/50 bg-sky-100 text-zinc-950 hover:bg-white" },
+  { key: "warm-max", label: "Warm 100", ct: 3000, bright: 100, className: "border-amber-300/50 bg-amber-200 text-zinc-950 hover:bg-amber-100" },
+  { key: "warm-dim", label: "Warm 20", ct: 2200, bright: 20, className: "border-orange-400/40 bg-orange-900/70 text-orange-100 hover:bg-orange-800" },
+];
+
 const rgbToHex = (rgb) => {
   if (!Array.isArray(rgb) || rgb.length !== 3) return "#ffffff";
   return `#${rgb.map((v) => clamp(Math.round(v), 0, 255).toString(16).padStart(2, "0")).join("")}`;
@@ -376,6 +382,35 @@ function useYeelight() {
         ),
       );
     },
+    preset: async (target, preset) => {
+      const nextCt = clamp(Math.round(preset?.ct ?? 4000), 1700, 6500);
+      const nextLevel = clamp(Math.round(preset?.bright ?? 100), 1, 100);
+      patchTargets(target, { bright: nextLevel, ct: nextCt, color_mode: 2, power: "on" });
+      await withPending(target, async () => {
+        await withTargetLock(
+          target,
+          async () => {
+            const encodedTarget = encodeURIComponent(target);
+            await safeAction(
+              () => request(
+                `/ct/${encodedTarget}?k=${nextCt}`,
+                { method: "POST" },
+                12000,
+                `ct:${target}`,
+              ),
+            );
+            await safeAction(
+              () => request(
+                `/bright/${encodedTarget}?level=${nextLevel}`,
+                { method: "POST" },
+                12000,
+                `bright:${target}`,
+              ),
+            );
+          },
+        );
+      });
+    },
     rgb: async (target, rgb) => {
       const [r, g, b] = rgb.map((v) => clamp(Math.round(v), 0, 255));
       patchTargets(target, { rgb: [r, g, b], color_mode: 1, power: "on" });
@@ -637,6 +672,7 @@ function ControlCard({ title, target, state, actions, members, music }) {
   const musicAllOff = memberMusic.length > 0 && memberMusic.every((v) => !v);
   const musicStateText = musicAllOn ? "ON" : musicAllOff ? "OFF" : "MIXED";
   const nextMusicEnabled = !musicAllOn;
+  const presetButtonClass = "min-h-9 rounded-lg border px-2 py-1 text-[11px] font-semibold transition disabled:opacity-50 sm:text-xs";
 
   return (
     <article className="rounded-2xl border border-zinc-700 bg-zinc-900/70 p-2.5 sm:p-4">
@@ -685,6 +721,21 @@ function ControlCard({ title, target, state, actions, members, music }) {
         >
           <RefreshCcw className="h-3.5 w-3.5" />
         </button>
+      </div>
+
+      <div className="mb-3 grid grid-cols-3 gap-1.5">
+        {LIGHT_PRESETS.map((preset) => (
+          <button
+            key={preset.key}
+            type="button"
+            onClick={() => actions.preset(target, preset)}
+            disabled={pending}
+            className={`${presetButtonClass} ${preset.className}`}
+            title={`${preset.ct}K at ${preset.bright}%`}
+          >
+            {preset.label}
+          </button>
+        ))}
       </div>
 
       <div className="mb-3">
