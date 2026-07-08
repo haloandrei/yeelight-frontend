@@ -7,9 +7,9 @@ const REQUEST_DEDUP = new Map();
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
 const LIGHT_PRESETS = [
-  { key: "white-max", label: "White 100", ct: 6500, bright: 100, className: "border-sky-300/50 bg-sky-100 text-zinc-950 hover:bg-white" },
-  { key: "warm-max", label: "Warm 100", ct: 3000, bright: 100, className: "border-amber-300/50 bg-amber-200 text-zinc-950 hover:bg-amber-100" },
-  { key: "warm-dim", label: "Warm 20", ct: 2200, bright: 20, className: "border-orange-400/40 bg-orange-900/70 text-orange-100 hover:bg-orange-800" },
+  { key: "white-max", label: "White 100", shortLabel: "White", ct: 6500, bright: 100, className: "border-sky-300/50 bg-sky-100 text-zinc-950 hover:bg-white" },
+  { key: "warm-max", label: "Warm 100", shortLabel: "Warm", ct: 3000, bright: 100, className: "border-amber-300/50 bg-amber-200 text-zinc-950 hover:bg-amber-100" },
+  { key: "warm-dim", label: "Warm 20", shortLabel: "20%", ct: 2200, bright: 20, className: "border-orange-400/40 bg-orange-900/70 text-orange-100 hover:bg-orange-800" },
 ];
 
 const rgbToHex = (rgb) => {
@@ -382,6 +382,21 @@ function useYeelight() {
         ),
       );
     },
+    ct: async (target, kelvin) => {
+      const nextCt = clamp(Math.round(kelvin), 1700, 6500);
+      patchTargets(target, { ct: nextCt, color_mode: 2, power: "on" });
+      await withTargetLock(
+        target,
+        () => safeAction(
+          () => request(
+            `/ct/${encodeURIComponent(target)}?k=${nextCt}`,
+            { method: "POST" },
+            12000,
+            `ct:${target}`,
+          ),
+        ),
+      );
+    },
     preset: async (target, preset) => {
       const nextCt = clamp(Math.round(preset?.ct ?? 4000), 1700, 6500);
       const nextLevel = clamp(Math.round(preset?.bright ?? 100), 1, 100);
@@ -503,14 +518,15 @@ function groupAggregate(memberNames, states) {
   const knownPower = memberStates.map((s) => s?.power).filter((p) => p === "on" || p === "off");
   const allOn = knownPower.length > 0 && knownPower.every((p) => p === "on");
   const allOff = knownPower.length > 0 && knownPower.every((p) => p === "off");
-  const sample = memberStates.find((s) => Array.isArray(s?.rgb) && s.rgb.length === 3)
-    || memberStates.find((s) => typeof s?.bright === "number")
-    || {};
+  const brightSample = memberStates.find((s) => typeof s?.bright === "number") || {};
+  const ctSample = memberStates.find((s) => typeof s?.ct === "number") || {};
+  const rgbSample = memberStates.find((s) => Array.isArray(s?.rgb) && s.rgb.length === 3) || {};
 
   return {
     power: allOn ? "on" : allOff ? "off" : "mixed",
-    bright: typeof sample.bright === "number" ? sample.bright : 50,
-    rgb: Array.isArray(sample.rgb) && sample.rgb.length === 3 ? sample.rgb : [255, 110, 30],
+    bright: typeof brightSample.bright === "number" ? brightSample.bright : 50,
+    ct: typeof ctSample.ct === "number" ? ctSample.ct : 4000,
+    rgb: Array.isArray(rgbSample.rgb) && rgbSample.rgb.length === 3 ? rgbSample.rgb : [255, 110, 30],
   };
 }
 
@@ -563,7 +579,7 @@ function HsvColorPicker({ rgb, onPreview, onCommit, disabled = false }) {
     <div className="space-y-2">
       <div
         ref={planeRef}
-        className="relative h-36 w-full rounded-xl border border-zinc-600 cursor-crosshair"
+        className="relative h-28 w-full rounded-xl border border-zinc-600 cursor-crosshair sm:h-36"
         style={{
           touchAction: "none",
           backgroundColor: `hsl(${hsv.h} 100% 50%)`,
@@ -627,8 +643,10 @@ function HsvColorPicker({ rgb, onPreview, onCommit, disabled = false }) {
 
 function ControlCard({ title, target, state, actions, members, music }) {
   const [brightness, setBrightness] = useState(50);
+  const [colorTemp, setColorTemp] = useState(4000);
   const [rgb, setRgb] = useState([255, 110, 30]);
   const committedBrightnessRef = useRef(50);
+  const committedColorTempRef = useRef(4000);
   const committedRgbRef = useRef("255,110,30");
 
   useEffect(() => {
@@ -636,6 +654,11 @@ function ControlCard({ title, target, state, actions, members, music }) {
       const next = clamp(state.bright, 1, 100);
       committedBrightnessRef.current = next;
       setBrightness(next);
+    }
+    if (typeof state?.ct === "number") {
+      const next = clamp(state.ct, 1700, 6500);
+      committedColorTempRef.current = next;
+      setColorTemp(next);
     }
     if (Array.isArray(state?.rgb) && state.rgb.length === 3) {
       const nextRgb = state.rgb.map((v) => clamp(Number(v) || 0, 0, 255));
@@ -655,6 +678,14 @@ function ControlCard({ title, target, state, actions, members, music }) {
     actions.bright(target, next);
   };
 
+  const commitColorTemp = (value = colorTemp) => {
+    if (pending) return;
+    const next = clamp(Math.round(value), 1700, 6500);
+    if (next === committedColorTempRef.current) return;
+    committedColorTempRef.current = next;
+    actions.ct(target, next);
+  };
+
   const commitRgb = (nextRgb) => {
     if (pending || !Array.isArray(nextRgb)) return;
     const normalized = nextRgb.map((v) => clamp(Math.round(v), 0, 255));
@@ -672,11 +703,11 @@ function ControlCard({ title, target, state, actions, members, music }) {
   const musicAllOff = memberMusic.length > 0 && memberMusic.every((v) => !v);
   const musicStateText = musicAllOn ? "ON" : musicAllOff ? "OFF" : "MIXED";
   const nextMusicEnabled = !musicAllOn;
-  const presetButtonClass = "min-h-9 rounded-lg border px-2 py-1 text-[11px] font-semibold transition disabled:opacity-50 sm:text-xs";
+  const presetButtonClass = "min-h-8 min-w-0 rounded-lg border px-1 py-1 text-[10px] font-semibold leading-tight transition disabled:opacity-50 sm:min-h-9 sm:px-2 sm:text-xs";
 
   return (
-    <article className="rounded-2xl border border-zinc-700 bg-zinc-900/70 p-2.5 sm:p-4">
-      <div className="mb-3 flex items-start justify-between gap-2">
+    <article className="min-w-0 rounded-2xl border border-zinc-700 bg-zinc-900/70 p-2.5 sm:p-4">
+      <div className="mb-2 flex items-start justify-between gap-2 sm:mb-3">
         <div className="min-w-0">
           <h3 className="truncate text-sm font-semibold text-white">{title}</h3>
           {members ? (
@@ -694,7 +725,7 @@ function ControlCard({ title, target, state, actions, members, music }) {
         </div>
       ) : null}
 
-      <div className="mb-3 flex items-center gap-1.5">
+      <div className="mb-2 flex items-center gap-1.5 sm:mb-3">
         <button
           type="button"
           onClick={() => actions.power(target, true)}
@@ -723,7 +754,7 @@ function ControlCard({ title, target, state, actions, members, music }) {
         </button>
       </div>
 
-      <div className="mb-3 grid grid-cols-3 gap-1.5">
+      <div className="mb-2 grid min-w-0 grid-cols-3 gap-1 sm:mb-3 sm:gap-1.5">
         {LIGHT_PRESETS.map((preset) => (
           <button
             key={preset.key}
@@ -733,37 +764,64 @@ function ControlCard({ title, target, state, actions, members, music }) {
             className={`${presetButtonClass} ${preset.className}`}
             title={`${preset.ct}K at ${preset.bright}%`}
           >
-            {preset.label}
+            <span className="sm:hidden">{preset.shortLabel}</span>
+            <span className="hidden sm:inline">{preset.label}</span>
           </button>
         ))}
       </div>
 
-      <div className="mb-3">
-        <div className="mb-1 flex items-center justify-between text-xs text-zinc-300">
-          <span>Brightness</span>
-          <span>{brightness}</span>
+      <div className="mb-2 grid gap-2 sm:mb-3">
+        <div>
+          <div className="mb-1 flex items-center justify-between text-xs text-zinc-300">
+            <span>Brightness</span>
+            <span>{brightness}%</span>
+          </div>
+          <input
+            type="range"
+            min={1}
+            max={100}
+            value={brightness}
+            disabled={pending}
+            onChange={(event) => {
+              const next = Number(event.target.value);
+              setBrightness(next);
+            }}
+            onPointerUp={(event) => commitBrightness(Number(event.currentTarget.value))}
+            onTouchEnd={(event) => commitBrightness(Number(event.currentTarget.value))}
+            onKeyUp={(event) => commitBrightness(Number(event.currentTarget.value))}
+            onBlur={(event) => commitBrightness(Number(event.currentTarget.value))}
+            className="w-full accent-red-500"
+          />
         </div>
-        <input
-          type="range"
-          min={1}
-          max={100}
-          value={brightness}
-          disabled={pending}
-          onChange={(event) => {
-            const next = Number(event.target.value);
-            setBrightness(next);
-          }}
-          onPointerUp={(event) => commitBrightness(Number(event.currentTarget.value))}
-          onTouchEnd={(event) => commitBrightness(Number(event.currentTarget.value))}
-          onKeyUp={(event) => commitBrightness(Number(event.currentTarget.value))}
-          onBlur={(event) => commitBrightness(Number(event.currentTarget.value))}
-          className="w-full accent-red-500"
-        />
+
+        <div>
+          <div className="mb-1 flex items-center justify-between text-xs text-zinc-300">
+            <span>Temp</span>
+            <span>{colorTemp}K</span>
+          </div>
+          <input
+            type="range"
+            min={1700}
+            max={6500}
+            step={100}
+            value={colorTemp}
+            disabled={pending}
+            onChange={(event) => {
+              const next = Number(event.target.value);
+              setColorTemp(next);
+            }}
+            onPointerUp={(event) => commitColorTemp(Number(event.currentTarget.value))}
+            onTouchEnd={(event) => commitColorTemp(Number(event.currentTarget.value))}
+            onKeyUp={(event) => commitColorTemp(Number(event.currentTarget.value))}
+            onBlur={(event) => commitColorTemp(Number(event.currentTarget.value))}
+            className="w-full accent-amber-400"
+          />
+        </div>
       </div>
 
       <div className="mb-2 flex items-center justify-between text-xs text-zinc-300">
         <span>Color</span>
-        <span className="rounded-md border border-zinc-600 px-2 py-1 font-mono" style={{ backgroundColor: rgbToHex(rgb) }}>
+        <span className="hidden rounded-md border border-zinc-600 px-2 py-1 font-mono sm:inline" style={{ backgroundColor: rgbToHex(rgb) }}>
           {rgbToHex(rgb).toUpperCase()}
         </span>
       </div>
@@ -775,15 +833,15 @@ function ControlCard({ title, target, state, actions, members, music }) {
       />
 
       {Array.isArray(members) ? (
-        <div className="mt-3 flex items-center justify-between rounded-lg border border-zinc-700 bg-zinc-950/70 px-2 py-2">
-          <span className="text-xs text-zinc-300">Music mode: <span className="font-semibold">{musicStateText}</span></span>
+        <div className="mt-3 flex items-center justify-between gap-2 rounded-lg border border-zinc-700 bg-zinc-950/70 px-2 py-2">
+          <span className="truncate text-xs text-zinc-300">Music: <span className="font-semibold">{musicStateText}</span></span>
           <button
             type="button"
             disabled={pending || musicPending}
             onClick={() => actions.setMusicMode(target, nextMusicEnabled)}
-            className="rounded-md border border-zinc-600 bg-zinc-800 px-2 py-1 text-xs font-semibold text-white hover:bg-zinc-700 disabled:opacity-50"
+            className="shrink-0 rounded-md border border-zinc-600 bg-zinc-800 px-2 py-1 text-xs font-semibold text-white hover:bg-zinc-700 disabled:opacity-50"
           >
-            {musicPending ? "Switching..." : nextMusicEnabled ? "Enable" : "Disable"}
+            {musicPending ? "..." : nextMusicEnabled ? "On" : "Off"}
           </button>
         </div>
       ) : null}
@@ -1088,24 +1146,24 @@ export default function YeelightControlApp() {
   return (
     <div className="min-h-screen bg-black text-white">
       <header className="sticky top-0 z-10 border-b border-zinc-800 bg-black/90 backdrop-blur">
-        <div className="mx-auto flex w-full max-w-7xl items-center justify-between gap-2 px-2 py-2 sm:gap-3 sm:px-4 sm:py-3">
-          <div>
-            <h1 className="text-lg font-semibold">Yeelight Live Control</h1>
+        <div className="mx-auto flex w-full max-w-7xl items-center justify-between gap-1.5 px-2 py-2 sm:gap-3 sm:px-4 sm:py-3">
+          <div className="min-w-0">
+            <h1 className="truncate text-base font-semibold sm:text-lg">Yeelight</h1>
             <p className="hidden text-xs text-zinc-400 sm:block">Port 5005 • Real-time state sync</p>
           </div>
 
-          <div className="flex items-center gap-1.5 sm:gap-2">
-            <span className="inline-flex items-center gap-1 rounded-full border border-zinc-700 px-2 py-1 text-xs text-zinc-300">
+          <div className="flex min-w-0 shrink-0 items-center gap-1 sm:gap-2">
+            <span className="inline-flex h-9 w-9 items-center justify-center rounded-xl border border-zinc-700 text-xs text-zinc-300 sm:h-auto sm:w-auto sm:gap-1 sm:rounded-full sm:px-2 sm:py-1">
               {liveMode === "stream" ? <Wifi className="h-3.5 w-3.5 text-emerald-400" /> : <WifiOff className="h-3.5 w-3.5 text-amber-400" />}
-              {liveMode === "stream" ? "stream" : "poll"}
+              <span className="hidden sm:inline">{liveMode === "stream" ? "stream" : "poll"}</span>
             </span>
-            <span className="rounded-full border border-zinc-700 px-2 py-1 text-xs text-zinc-300">
+            <span className="hidden rounded-full border border-zinc-700 px-2 py-1 text-xs text-zinc-300 md:inline">
               sync {formatSync(lastSyncAt)}
             </span>
             <button
               type="button"
               onClick={() => actions.refresh()}
-              className="rounded-xl border border-zinc-700 bg-zinc-900 p-2 text-zinc-200 hover:bg-zinc-800"
+              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-zinc-700 bg-zinc-900 text-zinc-200 hover:bg-zinc-800 sm:h-10 sm:w-10"
               aria-label="Refresh"
             >
               {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCcw className="h-4 w-4" />}
@@ -1114,10 +1172,11 @@ export default function YeelightControlApp() {
               type="button"
               onClick={() => actions.power("all", false)}
               disabled={allPending}
-              className="inline-flex w-[10.5rem] items-center justify-center gap-2 rounded-xl border border-red-500/40 bg-red-600/90 px-3 py-2 text-sm font-semibold text-white hover:bg-red-500 disabled:opacity-80 sm:w-[12rem]"
+              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-red-500/40 bg-red-600/90 text-sm font-semibold text-white hover:bg-red-500 disabled:opacity-80 sm:h-10 sm:w-auto sm:min-w-32 sm:gap-2 sm:px-3"
+              aria-label="Shut down all lights"
             >
               {allPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Power className="h-4 w-4" />}
-              <span>{allPending ? "Switching..." : "Shut Down"}</span>
+              <span className="hidden sm:inline">{allPending ? "..." : "Off All"}</span>
             </button>
           </div>
         </div>
@@ -1133,15 +1192,15 @@ export default function YeelightControlApp() {
         <section className="mb-6">
           <div className="mb-2 flex items-center justify-between">
             <h2 className="text-base font-semibold">Groups</h2>
-            <span className="text-xs text-zinc-400">Fixed one row, three columns</span>
+            <span className="hidden text-xs text-zinc-400 sm:inline">Three quick groups</span>
           </div>
 
-          <div className="grid grid-cols-3 gap-2 sm:gap-3">
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-3 sm:gap-3">
             {Array.from({ length: 3 }).map((_, index) => {
               const entry = primaryGroups[index];
               if (!entry) {
                 return (
-                  <div key={`placeholder-${index}`} className="rounded-2xl border border-dashed border-zinc-700 bg-zinc-950/50 p-4 text-xs text-zinc-500">
+                  <div key={`placeholder-${index}`} className="hidden rounded-2xl border border-dashed border-zinc-700 bg-zinc-950/50 p-4 text-xs text-zinc-500 sm:block">
                     Empty group slot
                   </div>
                 );
